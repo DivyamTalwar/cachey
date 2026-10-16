@@ -466,6 +466,7 @@ impl Downloader {
             .await
             .map_err(|error| DownloadError::BodyStreaming(error.to_string()))?
         {
+            self.throughput.lock().record(chunk.len());
             if chunk.len() as u64 > expected_data_len.saturating_sub(data.len() as u64) {
                 return Err(DownloadError::BodyStreaming(format!(
                     "Body exceeds expected {expected_data_len} bytes"
@@ -479,7 +480,6 @@ impl Downloader {
                 data.len()
             )));
         }
-        self.throughput.lock().record(data.len());
         Ok(ObjectPiece {
             mtime,
             data: data.freeze(),
@@ -725,6 +725,75 @@ mod tests {
             .expect("excess data must be rejected without waiting for the rest of the body");
             assert!(matches!(result, Err(DownloadError::BodyStreaming(_))));
         }
+        advance(Duration::from_secs(1)).await;
+        assert_ingress_bps(&downloader, 1, 16.0);
+    }
+
+    fn streamed_response(fail: bool) -> GetObjectOutput {
+        let body = async_stream::stream! {
+            yield Ok(Frame::data(Bytes::from_static(b"abcd")));
+            sleep(Duration::from_secs(2)).await;
+            if fail {
+                yield Err(io::Error::other("body interrupted after the first chunk"));
+            } else {
+                yield Ok(Frame::data(Bytes::from_static(b"efgh")));
+            }
+        };
+        GetObjectOutput::builder()
+            .content_range("bytes 0-7/8")
+            .body(ByteStream::new(SdkBody::from_body_1_x(StreamBody::new(
+                body,
+            ))))
+            .build()
+    }
+
+    fn assert_ingress_bps(downloader: &Downloader, seconds: u64, expected: f64) {
+        let actual = downloader
+            .throughput
+            .lock()
+            .bps(Duration::from_secs(seconds));
+        assert!(
+            (actual - expected).abs() < 1e-9,
+            "expected {expected} ingress bytes/s, got {actual}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn ingress_tracks_body_bytes_in_their_arrival_windows() {
+        let downloader = downloader([]);
+        let read = downloader.read_response(&(0..8), streamed_response(false));
+        tokio::pin!(read);
+        assert!(futures::poll!(&mut read).is_pending());
+        advance(Duration::from_secs(1)).await;
+        assert_ingress_bps(&downloader, 1, 4.0);
+        let piece = read.await.unwrap();
+        assert_eq!(piece.data, Bytes::from_static(b"abcdefgh"));
+        advance(Duration::from_secs(1)).await;
+        assert_ingress_bps(&downloader, 1, 4.0);
+        assert_ingress_bps(&downloader, 3, 8.0 / 3.0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn failed_body_bytes_remain_in_ingress() {
+        let downloader = downloader([]);
+        let read = downloader.read_response(&(0..8), streamed_response(true));
+        tokio::pin!(read);
+        assert!(futures::poll!(&mut read).is_pending());
+        assert!(matches!(read.await, Err(DownloadError::BodyStreaming(_))));
+        advance(Duration::from_secs(1)).await;
+        assert_ingress_bps(&downloader, 3, 4.0 / 3.0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cancelled_body_bytes_remain_in_ingress() {
+        let downloader = downloader([]);
+        {
+            let read = downloader.read_response(&(0..8), streamed_response(false));
+            tokio::pin!(read);
+            assert!(futures::poll!(&mut read).is_pending());
+        }
+        advance(Duration::from_secs(1)).await;
+        assert_ingress_bps(&downloader, 1, 4.0);
     }
 
     #[test]

@@ -85,6 +85,11 @@ Stalls and canceled reads can raise routing latency estimates without adding
 successful histogram samples. A single-bucket hedge win is timed from the original
 primary start. Latency histograms exclude failures and client body transmission.
 
+Ingress throughput counts response-body bytes as the S3 SDK yields them to Cachey,
+including bytes from incomplete, canceled, or rejected downloads. It excludes
+response headers and transport overhead. Download success and latency observations
+still require a complete, validated response.
+
 `DownloadOutput` reports the initial and winning buckets. `hedged` means copies
 overlapped, including rescue and recovery probes; the page `fallback` metric counts
 successes from a bucket other than the initial choice.
