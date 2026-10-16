@@ -153,6 +153,8 @@ impl CacheyService {
         self.egress_throughput.lock().bps(lookback)
     }
 
+    /// Stream the requested bytes, stopping at the object end when the range extends past it.
+    ///
     /// # Panics
     ///
     /// If `byterange.start >= byterange.end` or `byterange.end > MAX_RANGE_END`.
@@ -182,7 +184,7 @@ impl CacheyService {
         });
         let mut object_size = None;
 
-        futures::stream::iter(pagerange)
+        let chunks = futures::stream::iter(pagerange)
             .map(move |page_id| executor.clone().execute(page_id, self.cache.clone()))
             .buffered(concurrency.get())
             .map(move |result| {
@@ -204,7 +206,20 @@ impl CacheyService {
                     object_size: value.object_size,
                     cached_at: NonZeroU32::new(value.cached_at),
                 })
-            })
+            });
+
+        async_stream::stream! {
+            let mut chunks = std::pin::pin!(chunks);
+            while let Some(chunk) = chunks.next().await {
+                let reaches_eof = chunk
+                    .as_ref()
+                    .is_ok_and(|chunk| chunk.range.end == chunk.object_size);
+                yield chunk;
+                if reaches_eof {
+                    break;
+                }
+            }
+        }
     }
 
     pub fn into_router(self) -> axum::Router {
@@ -381,10 +396,16 @@ mod tests {
             .unwrap();
         let start = start.parse::<usize>().unwrap();
         let end = (end.parse::<usize>().unwrap() + 1).min(state.object.len());
-        assert!(start < end);
 
         state.request_count.fetch_add(1, Ordering::Relaxed);
         tokio::time::sleep(state.response_delay).await;
+        if start >= end {
+            return (
+                StatusCode::RANGE_NOT_SATISFIABLE,
+                [("content-range", format!("bytes */{}", state.object.len()))],
+                Bytes::from_static(b"<Error><Code>InvalidRange</Code></Error>"),
+            );
+        }
         (
             StatusCode::PARTIAL_CONTENT,
             [(
@@ -475,6 +496,87 @@ mod tests {
         ] {
             assert_eq!(pagerange(&bytes), pages, "{bytes:?}");
         }
+    }
+
+    async fn assert_library_reads_stop_at_eof(concurrency: NonZeroUsize) {
+        for object_size in [22, PAGE_SIZE as usize, PAGE_SIZE as usize + 22] {
+            let kind = ObjectKind::new("library-eof").unwrap();
+            let object = ObjectKey::new("object").unwrap();
+            let bucket = BucketName::new("bucket").unwrap();
+            let data = Bytes::from(
+                (0..object_size)
+                    .map(|index| (index % 251) as u8)
+                    .collect::<Vec<_>>(),
+            );
+            let (endpoint, request_count, server_handle) =
+                spawn_mock_s3_server(&bucket, &object, data.clone(), Duration::ZERO).await;
+            let service = CacheyService::new(
+                ServiceConfig {
+                    cache: CacheConfig {
+                        memory_size: ByteSize::mib(512),
+                        disk_cache: None,
+                        metrics_registry: None,
+                    },
+                    download_limits: DownloadLimits::default(),
+                },
+                mock_s3_client(&endpoint),
+                axum_server::Handle::new(),
+            )
+            .await
+            .unwrap();
+            let read = |range| {
+                service
+                    .clone()
+                    .get(
+                        kind.clone(),
+                        object.clone(),
+                        bucket.clone().into(),
+                        range,
+                        concurrency,
+                        RequestConfig::default(),
+                    )
+                    .try_collect::<Vec<_>>()
+            };
+            let cold = read(0..3 * PAGE_SIZE).await;
+            let warm = read(0..3 * PAGE_SIZE).await;
+            let backend_requests = request_count.load(Ordering::Relaxed);
+            let unsatisfied = read(object_size as u64..object_size as u64 + 1).await;
+            service.cache.close().await.unwrap();
+            server_handle.abort();
+
+            let expected_pages = object_size.div_ceil(PAGE_SIZE as usize);
+            for (result, cached) in [(cold, false), (warm, true)] {
+                let chunks = result.expect("a range intersecting the object should stop at EOF");
+                assert_eq!(chunks.len(), expected_pages);
+                assert_eq!(chunks.last().unwrap().range.end, object_size as u64);
+                for chunk in chunks {
+                    assert_eq!(
+                        chunk.data,
+                        data.slice(chunk.range.start as usize..chunk.range.end as usize)
+                    );
+                    assert_eq!(chunk.cached_at.is_some(), cached);
+                }
+            }
+            if concurrency == NonZeroUsize::MIN {
+                assert_eq!(backend_requests, expected_pages);
+            }
+            assert!(matches!(
+                unsatisfied,
+                Err(ServiceError::Download(crate::object_store::DownloadError::RangeNotSatisfied {
+                    object_size: Some(size), ..
+                })) if size == object_size as u64
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn library_reads_stop_at_the_object_end() {
+        assert_library_reads_stop_at_eof(NonZeroUsize::MIN).await;
+    }
+
+    #[tokio::test]
+    async fn library_prefetch_stops_at_the_object_end() {
+        assert_library_reads_stop_at_eof(NonZeroUsize::new(2).unwrap()).await;
     }
 
     #[tokio::test]
