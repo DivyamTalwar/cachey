@@ -396,8 +396,7 @@ impl Downloader {
             .get_object()
             .bucket(&**bucket)
             .key(&**object)
-            .range(format!("bytes={}-{}", byterange.start, byterange.end - 1))
-            .checksum_mode(aws_sdk_s3::types::ChecksumMode::Enabled);
+            .range(format!("bytes={}-{}", byterange.start, byterange.end - 1));
 
         let started = Instant::now();
         let output = if req_config.is_noop() {
@@ -496,13 +495,13 @@ mod tests {
         ops::Range,
         sync::{
             Arc,
-            atomic::{AtomicUsize, Ordering},
+            atomic::{AtomicBool, AtomicUsize, Ordering},
         },
         time::Duration,
     };
 
     use aws_sdk_s3::{
-        config::{Credentials, Region, retry::RetryConfig},
+        config::{Credentials, Region, ResponseChecksumValidation, retry::RetryConfig},
         error::ErrorMetadata,
         operation::get_object::{GetObjectError, GetObjectOutput},
         primitives::{ByteStream, SdkBody},
@@ -551,11 +550,22 @@ mod tests {
         active: AtomicUsize,
         service_errors: Mutex<HashMap<usize, u16>>,
         range_error_sizes: Mutex<HashMap<usize, u64>>,
+        checksum_modes: Mutex<Vec<Option<String>>>,
+        reject_checksum_mode: AtomicBool,
+        response_checksum: Mutex<Option<&'static str>>,
     }
 
     impl HttpConnector for ScriptedConnector {
         fn call(&self, request: HttpRequest) -> HttpConnectorFuture {
             let request_idx = self.state.requests.fetch_add(1, Ordering::SeqCst);
+            let checksum_mode = request
+                .headers()
+                .get("x-amz-checksum-mode")
+                .map(str::to_owned);
+            let reject_checksum_mode =
+                checksum_mode.is_some() && self.state.reject_checksum_mode.load(Ordering::SeqCst);
+            self.state.checksum_modes.lock().push(checksum_mode);
+            let response_checksum = *self.state.response_checksum.lock();
             self.state.active.fetch_add(1, Ordering::SeqCst);
             let active = ActiveRequest(self.state.clone());
             let service_error = self.state.service_errors.lock().get(&request_idx).copied();
@@ -577,6 +587,14 @@ mod tests {
             );
             HttpConnectorFuture::new(async move {
                 sleep(Duration::from_millis(headers_ms)).await;
+                if reject_checksum_mode {
+                    return Ok(HttpResponse::new(
+                        400.try_into().unwrap(),
+                        SdkBody::from(
+                            "<Error><Code>InvalidArgument</Code><Message>Unsupported header: x-amz-checksum-mode</Message></Error>",
+                        ),
+                    ));
+                }
                 if let Some(status) = service_error {
                     let code = match status {
                         404 => "NoSuchKey",
@@ -609,6 +627,11 @@ mod tests {
                     .headers_mut()
                     .insert("content-range", "bytes 0-3/4");
                 response.headers_mut().insert("content-length", "4");
+                if let Some(checksum) = response_checksum {
+                    response
+                        .headers_mut()
+                        .insert("x-amz-checksum-crc32", checksum);
+                }
                 Ok(response)
             })
         }
@@ -679,6 +702,78 @@ mod tests {
             }
         });
         found.expect("bucket observation")
+    }
+
+    async fn assert_when_required_checksum_policy(request_config: &RequestConfig) {
+        let (mut downloader, state) = scripted_downloader([("bucket", 0, 0, false)]);
+        downloader.s3 = aws_sdk_s3::Client::from_conf(
+            downloader
+                .s3
+                .config()
+                .to_builder()
+                .response_checksum_validation(ResponseChecksumValidation::WhenRequired)
+                .build(),
+        );
+        state.reject_checksum_mode.store(true, Ordering::SeqCst);
+        let output = fetch_with_config(&downloader, &["bucket"], request_config)
+            .await
+            .expect("WhenRequired must allow reads without the optional checksum header");
+        assert_eq!(output.piece.data, Bytes::from_static(b"data"));
+        assert_eq!(*state.checksum_modes.lock(), [None]);
+    }
+
+    #[tokio::test]
+    async fn when_required_omits_optional_checksum_mode() {
+        assert_when_required_checksum_policy(&RequestConfig::default()).await;
+    }
+
+    #[tokio::test]
+    async fn request_overrides_preserve_when_required_checksum_policy() {
+        let request_config = RequestConfig {
+            connect_timeout: Some(Duration::from_secs(1)),
+            max_attempts: Some(1),
+            force_path_style: Some(true),
+            ..RequestConfig::default()
+        };
+        assert_when_required_checksum_policy(&request_config).await;
+    }
+
+    #[tokio::test]
+    async fn default_and_when_supported_validate_response_checksums() {
+        for policy in [None, Some(ResponseChecksumValidation::WhenSupported)] {
+            for request_config in [
+                RequestConfig::default(),
+                RequestConfig {
+                    max_attempts: Some(1),
+                    ..RequestConfig::default()
+                },
+            ] {
+                for (checksum, valid) in [("rfPzYw==", true), ("bBVkdw==", false)] {
+                    let (mut downloader, state) = scripted_downloader([("bucket", 0, 0, false)]);
+                    if let Some(policy) = policy {
+                        downloader.s3 = aws_sdk_s3::Client::from_conf(
+                            downloader
+                                .s3
+                                .config()
+                                .to_builder()
+                                .response_checksum_validation(policy)
+                                .build(),
+                        );
+                    }
+                    *state.response_checksum.lock() = Some(checksum);
+                    let result = fetch_with_config(&downloader, &["bucket"], &request_config).await;
+                    assert_eq!(*state.checksum_modes.lock(), [Some("ENABLED".to_owned())]);
+                    if valid {
+                        assert_eq!(result.unwrap().piece.data, Bytes::from_static(b"data"));
+                    } else {
+                        assert!(
+                            matches!(result, Err(DownloadError::BodyStreaming(_))),
+                            "{result:?}"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[tokio::test]
