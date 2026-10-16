@@ -51,6 +51,14 @@ Space-separated key-value pairs to override S3 request configuration per page mi
 
 SDK overrides are bounded by the server's download deadlines; early hedges use one SDK attempt.
 
+Response checksum validation follows the AWS SDK client configuration. The SDK
+default, `WHEN_SUPPORTED`, requests and validates supported response checksums.
+For backends that do not support optional response checksums, the CLI accepts the
+standard `AWS_RESPONSE_CHECKSUM_VALIDATION=WHEN_REQUIRED` setting; Rust callers can
+set `ResponseChecksumValidation::WhenRequired` on their S3 client. Per-request
+`C0-Config` overrides preserve this policy. See the [AWS checksum configuration
+reference](https://docs.aws.amazon.com/sdkref/latest/guide/feature-dataintegrity.html).
+
 #### Example Request
 
 ```http
