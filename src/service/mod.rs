@@ -6,6 +6,7 @@ use std::{
         Arc,
         atomic::{AtomicBool, Ordering},
     },
+    task::Poll,
     time::Duration,
 };
 
@@ -184,7 +185,7 @@ impl CacheyService {
         });
         let mut object_size = None;
 
-        let chunks = futures::stream::iter(pagerange)
+        let mut chunks = futures::stream::iter(pagerange)
             .map(move |page_id| executor.clone().execute(page_id, self.cache.clone()))
             .buffered(concurrency.get())
             .map(move |result| {
@@ -208,18 +209,19 @@ impl CacheyService {
                 })
             });
 
-        async_stream::stream! {
-            let mut chunks = std::pin::pin!(chunks);
-            while let Some(chunk) = chunks.next().await {
-                let reaches_eof = chunk
-                    .as_ref()
-                    .is_ok_and(|chunk| chunk.range.end == chunk.object_size);
-                yield chunk;
-                if reaches_eof {
-                    break;
-                }
+        let mut finished = false;
+        futures::stream::poll_fn(move |cx| {
+            if finished {
+                return Poll::Ready(None);
             }
-        }
+            let next = std::task::ready!(chunks.poll_next_unpin(cx));
+            finished = match &next {
+                Some(Ok(chunk)) => chunk.range.end == chunk.object_size,
+                Some(Err(_)) => false,
+                None => true,
+            };
+            Poll::Ready(next)
+        })
     }
 
     pub fn into_router(self) -> axum::Router {
@@ -362,9 +364,9 @@ mod tests {
     };
     use bytes::Bytes;
     use bytesize::ByteSize;
-    use futures::TryStreamExt;
+    use futures::{Stream, StreamExt, TryStreamExt};
 
-    use super::{CacheyService, PAGE_SIZE, ServiceConfig, ServiceError, metrics, pagerange};
+    use super::{CacheyService, Chunk, PAGE_SIZE, ServiceConfig, ServiceError, metrics, pagerange};
     use crate::{
         cache::{CacheConfig, CacheKey, CacheValue},
         object_store::{DownloadLimits, RequestConfig},
@@ -498,6 +500,17 @@ mod tests {
         }
     }
 
+    async fn collect_unpinned_chunks<S>(mut chunks: S) -> Result<Vec<Chunk>, ServiceError>
+    where
+        S: Stream<Item = Result<Chunk, ServiceError>> + Unpin,
+    {
+        let mut collected = Vec::new();
+        while let Some(chunk) = chunks.next().await {
+            collected.push(chunk?);
+        }
+        Ok(collected)
+    }
+
     async fn assert_library_reads_stop_at_eof(concurrency: NonZeroUsize) {
         for object_size in [22, PAGE_SIZE as usize, PAGE_SIZE as usize + 22] {
             let kind = ObjectKind::new("library-eof").unwrap();
@@ -525,17 +538,14 @@ mod tests {
             .await
             .unwrap();
             let read = |range| {
-                service
-                    .clone()
-                    .get(
-                        kind.clone(),
-                        object.clone(),
-                        bucket.clone().into(),
-                        range,
-                        concurrency,
-                        RequestConfig::default(),
-                    )
-                    .try_collect::<Vec<_>>()
+                collect_unpinned_chunks(service.clone().get(
+                    kind.clone(),
+                    object.clone(),
+                    bucket.clone().into(),
+                    range,
+                    concurrency,
+                    RequestConfig::default(),
+                ))
             };
             let cold = read(0..3 * PAGE_SIZE).await;
             let warm = read(0..3 * PAGE_SIZE).await;
